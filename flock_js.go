@@ -2,15 +2,17 @@
 // Use of this source code is governed by the BSD 3-Clause
 // license that can be found in the LICENSE file.
 
-//go:build !aix && !windows && !js
-// +build !aix,!windows,!js
+//go:build js
+// +build js
 
 package flock
 
 import (
-	"os"
-	"syscall"
+	"syscall/js"
 )
+
+var flock = js.Global().Get("flock")
+var funlock = js.Global().Get("funlock")
 
 // Lock is a blocking call to try and take an exclusive file lock. It will wait
 // until it is able to obtain the exclusive file lock. It's recommended that
@@ -26,7 +28,7 @@ import (
 // (RLock()), because calling Unlock() may accidentally release the exclusive
 // lock that was once a shared lock.
 func (f *Flock) Lock() error {
-	return f.lock(&f.l, syscall.LOCK_EX)
+	return f.lock(&f.l, false)
 }
 
 // RLock is a blocking call to try and take a shared file lock. It will wait
@@ -37,12 +39,22 @@ func (f *Flock) Lock() error {
 // If we are already shared-locked, this function short-circuits and returns
 // immediately assuming it can take the mutex lock.
 func (f *Flock) RLock() error {
-	return f.lock(&f.r, syscall.LOCK_SH)
+	return f.lock(&f.r, true)
 }
 
-func (f *Flock) lock(locked *bool, flag int) error {
+func (f *Flock) lock(locked *bool, readLock bool) (err error) {
 	f.m.Lock()
 	defer f.m.Unlock()
+
+	defer func() {
+		if x := recover(); x != nil {
+			e, ok := x.(error)
+			if !ok {
+				panic(x)
+			}
+			err = e
+		}
+	}()
 
 	if *locked {
 		return nil
@@ -55,20 +67,7 @@ func (f *Flock) lock(locked *bool, flag int) error {
 		defer f.ensureFhState()
 	}
 
-	if err := syscall.Flock(int(f.fh.Fd()), flag); err != nil {
-		shouldRetry, reopenErr := f.reopenFDOnError(err)
-		if reopenErr != nil {
-			return reopenErr
-		}
-
-		if !shouldRetry {
-			return err
-		}
-
-		if err = syscall.Flock(int(f.fh.Fd()), flag); err != nil {
-			return err
-		}
-	}
+	flock.Invoke(int(f.fh.Fd()), readLock)
 
 	*locked = true
 	return nil
@@ -84,9 +83,19 @@ func (f *Flock) lock(locked *bool, flag int) error {
 // Please note, if your shared lock became an exclusive lock this may
 // unintentionally drop the exclusive lock if called by the consumer that
 // believes they have a shared lock. Please see Lock() for more details.
-func (f *Flock) Unlock() error {
+func (f *Flock) Unlock() (err error) {
 	f.m.Lock()
 	defer f.m.Unlock()
+
+	defer func() {
+		if x := recover(); x != nil {
+			e, ok := x.(error)
+			if !ok {
+				panic(x)
+			}
+			err = e
+		}
+	}()
 
 	// if we aren't locked or if the lockfile instance is nil
 	// just return a nil error because we are unlocked
@@ -94,10 +103,7 @@ func (f *Flock) Unlock() error {
 		return nil
 	}
 
-	// mark the file as unlocked
-	if err := syscall.Flock(int(f.fh.Fd()), syscall.LOCK_UN); err != nil {
-		return err
-	}
+	funlock.Invoke(int(f.fh.Fd()))
 
 	f.fh.Close()
 
@@ -117,7 +123,7 @@ func (f *Flock) Unlock() error {
 // file lock, the function will return false instead of waiting for the lock. If
 // we get the lock, we also set the *Flock instance as being exclusive-locked.
 func (f *Flock) TryLock() (bool, error) {
-	return f.try(&f.l, syscall.LOCK_EX)
+	return f.try(&f.l, false)
 }
 
 // TryRLock is the preferred function for taking a shared file lock. This
@@ -129,12 +135,22 @@ func (f *Flock) TryLock() (bool, error) {
 // lock, the function will return false instead of waiting for the lock. If we
 // get the lock, we also set the *Flock instance as being share-locked.
 func (f *Flock) TryRLock() (bool, error) {
-	return f.try(&f.r, syscall.LOCK_SH)
+	return f.try(&f.r, true)
 }
 
-func (f *Flock) try(locked *bool, flag int) (bool, error) {
+func (f *Flock) try(locked *bool, readLock bool) (ok bool, err error) {
 	f.m.Lock()
 	defer f.m.Unlock()
+
+	defer func() {
+		if x := recover(); x != nil {
+			e, ok := x.(error)
+			if !ok {
+				panic(x)
+			}
+			err = e
+		}
+	}()
 
 	if *locked {
 		return true, nil
@@ -147,52 +163,11 @@ func (f *Flock) try(locked *bool, flag int) (bool, error) {
 		defer f.ensureFhState()
 	}
 
-	var retried bool
-retry:
-	err := syscall.Flock(int(f.fh.Fd()), flag|syscall.LOCK_NB)
-
-	switch err {
-	case syscall.EWOULDBLOCK:
-		return false, nil
-	case nil:
-		*locked = true
-		return true, nil
-	}
-	if !retried {
-		if shouldRetry, reopenErr := f.reopenFDOnError(err); reopenErr != nil {
-			return false, reopenErr
-		} else if shouldRetry {
-			retried = true
-			goto retry
-		}
-	}
-
-	return false, err
-}
-
-// reopenFDOnError determines whether we should reopen the file handle
-// in readwrite mode and try again. This comes from util-linux/sys-utils/flock.c:
-//  Since Linux 3.4 (commit 55725513)
-//  Probably NFSv4 where flock() is emulated by fcntl().
-func (f *Flock) reopenFDOnError(err error) (bool, error) {
-	if err != syscall.EIO && err != syscall.EBADF {
+	lockDone := flock.Invoke(int(f.fh.Fd()), readLock, true)
+	if !lockDone.Bool() {
 		return false, nil
 	}
-	if st, err := f.fh.Stat(); err == nil {
-		// if the file is able to be read and written
-		if st.Mode()&0600 == 0600 {
-			f.fh.Close()
-			f.fh = nil
 
-			// reopen in read-write mode and set the filehandle
-			fh, err := os.OpenFile(f.path, os.O_CREATE|os.O_RDWR, os.FileMode(0600))
-			if err != nil {
-				return false, err
-			}
-			f.fh = fh
-			return true, nil
-		}
-	}
-
-	return false, nil
+	*locked = true
+	return true, nil
 }
